@@ -1,51 +1,83 @@
-# 1. Configuración de Spark
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import to_date, col
-import matplotlib.pyplot as plt
-import pandas as pd
+from pyspark.sql.functions import from_json, col, sum as _sum, avg, count, round as _round
+from pyspark.sql.types import StructType, StructField, IntegerType, DoubleType, StringType, TimestampType
 
-# Crear sesión de Spark
-spark = SparkSession.builder.appName("LibroOficialVentas").getOrCreate()
+# ── 1. Inicialización de Spark ────────────────────────────────────────────────
+spark = SparkSession.builder \
+    .appName("LoteriaVentasStreaming") \
+    .getOrCreate()
 
-# 2. Convertir Excel a CSV 
-excel_file = "libro_oficial_ventas.xlsx"
-csv_file = "libro_oficial_ventas.csv"
+# Reducir logs innecesarios
+spark.sparkContext.setLogLevel("WARN")
 
-# Leer Excel con Pandas y guardarlo como CSV
-df_excel = pd.read_excel(excel_file)
-df_excel.to_csv(csv_file, index=False)
+# ── 2. Esquema idéntico al JSON del Productor ─────────────────────────────────
+# IMPORTANTE: Los nombres deben estar en MAYÚSCULAS
+schema = StructType([
+    StructField("ANIO",      IntegerType(),   True),
+    StructField("MES",       IntegerType(),   True),
+    StructField("LOTERIA",   StringType(),    True),
+    StructField("VENTAS",    DoubleType(),    True),
+    StructField("TIMESTAMP", TimestampType(), True),
+])
 
-# 3. Cargar dataset con Spark
-df = spark.read.csv(csv_file, header=True, inferSchema=True)
+# ── 3. Conexión a Kafka ───────────────────────────────────────────────────────
+raw_df = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "loteria_ventas") \
+    .option("startingOffsets", "earliest") \
+    .load()
 
-# Mostrar primeras filas
-df.show(5)
+# ── 4. Transformación de Datos ────────────────────────────────────────────────
+# Convertimos el binario de Kafka a texto, aplicamos el JSON y expandimos
+loteria_df = (
+    raw_df
+    .select(from_json(col("value").cast("string"), schema).alias("data"))
+    .select("data.*")
+)
 
-# 4. Limpieza y transformación
-df_clean = df.dropna(subset=["Comprobante", "Fecha elaboracion", "Total"])
-df_clean = df_clean.withColumn("Fecha", to_date(col("Fecha elaboracion"), "yyyy-MM-dd"))
-df_clean = df_clean.withColumn("Total", col("Total").cast("double"))
+# ── 5. Análisis 1: Ventas Totales por Lotería ─────────────────────────────────
+ventas_por_loteria = (
+    loteria_df
+    .filter(col("LOTERIA").isNotNull())
+    .groupBy("LOTERIA")
+    .agg(
+        _round(_sum("VENTAS"), 0).alias("TOTAL_VENTAS"),
+        _round(avg("VENTAS"), 0).alias("PROMEDIO_VENTA"),
+        count("LOTERIA").alias("NUM_REGISTROS")
+    )
+)
 
-# 5. Análisis exploratorio
-# Ventas totales
-ventas_totales = df_clean.groupBy().sum("Total")
-ventas_totales.show()
+# ── 6. Análisis 2: Ventas Totales por Año ─────────────────────────────────────
+ventas_por_anio = (
+    loteria_df
+    .filter(col("ANIO").isNotNull())
+    .groupBy("ANIO")
+    .agg(
+        _round(_sum("VENTAS"), 0).alias("VENTAS_POR_ANIO"),
+        count("LOTERIA").alias("CONTEO_LOTERIAS")
+    )
+)
 
-# Ventas por sucursal
-ventas_sucursal = df_clean.groupBy("Sucursal").sum("Total")
-ventas_sucursal.show()
+# ── 7. Salida a Consola ───────────────────────────────────────────────────────
+# Query para ver el ranking por Lotería
+q1 = (
+    ventas_por_loteria.writeStream
+    .outputMode("complete")
+    .format("console")
+    .option("truncate", False)
+    .option("numRows", 20)
+    .start()
+)
 
-# Top 5 clientes con mayor total
-top_clientes = df_clean.groupBy("Nombre tercero").sum("Total") \
-    .orderBy(col("sum(Total)").desc()) \
-    .limit(5)
-top_clientes.show()
+# Query para ver el resumen por Año
+q2 = (
+    ventas_por_anio.writeStream
+    .outputMode("complete")
+    .format("console")
+    .option("truncate", False)
+    .start()
+)
 
-# 6. Visualización
-ventas_sucursal_pd = ventas_sucursal.toPandas()
-plt.bar(ventas_sucursal_pd["Sucursal"], ventas_sucursal_pd["sum(Total)"])
-plt.xlabel("Sucursal")
-plt.ylabel("Ventas Totales")
-plt.title("Ventas por Sucursal")
-plt.xticks(rotation=45)
-plt.show()
+# Mantener la aplicación activa
+spark.streams.awaitAnyTermination()
